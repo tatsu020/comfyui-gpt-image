@@ -270,9 +270,9 @@ class GPTImage1Generate(ComfyNodeABC):
 
                 img_binaries.append(img_binary)
                 if batch_size == 1:
-                    files.append(("image", img_binary))
+                    files.append(("image", (img_binary.name, img_binary, "image/png")))
                 else:
-                    files.append(("image[]", img_binary))
+                    files.append(("image[]", (img_binary.name, img_binary, "image/png")))
 
         if mask is not None:
             if image.shape[0] != 1:
@@ -294,35 +294,65 @@ class GPTImage1Generate(ComfyNodeABC):
             mask_img_byte_arr.seek(0)
             mask_binary = mask_img_byte_arr
             mask_binary.name = "mask.png"
-            files.append(("mask", mask_binary))
+            files.append(("mask", (mask_binary.name, mask_binary, "image/png")))
 
-        # Build the operation
-        operation = SynchronousOperation(
-            endpoint=ApiEndpoint(
-                path=path,
-                method=HttpMethod.POST,
-                request_model=request_class,
-                response_model=OpenAIImageGenerationResponse,
-            ),
-            request=request_class(
-                model=model,
-                prompt=prompt,
-                quality=quality,
-                background=background,
-                n=n,
-                seed=seed,
-                size=size,
-                moderation=moderation,
-            ),
-            files=files if files else None,
-            api_base=api_base,
-            auth_token=auth_token,
-        )
+        # Some OpenAI-compatible backends ignore n>1 and always return a single
+        # image, so fan out n single-image requests in parallel instead.
+        # BytesIO file objects are consumed per request: keep raw bytes and
+        # rebuild fresh streams for every call.
+        raw_files = None
+        if files:
+            raw_files = [(field, (fname, fobj.getvalue(), mime))
+                         for field, (fname, fobj, mime) in files]
 
-        response = operation.execute()
+        def _execute_one(i):
+            call_files = None
+            if raw_files is not None:
+                call_files = [(field, (fname, io.BytesIO(data), mime))
+                              for field, (fname, data, mime) in raw_files]
+            operation = SynchronousOperation(
+                endpoint=ApiEndpoint(
+                    path=path,
+                    method=HttpMethod.POST,
+                    request_model=request_class,
+                    response_model=OpenAIImageGenerationResponse,
+                ),
+                request=request_class(
+                    model=model,
+                    prompt=prompt,
+                    quality=quality,
+                    background=background,
+                    n=1,
+                    seed=(seed + i) if seed is not None else None,
+                    size=size,
+                    moderation=moderation,
+                ),
+                files=call_files,
+                api_base=api_base,
+                auth_token=auth_token,
+            )
+            return operation.execute()
 
-        img_tensor = validate_and_cast_response(response)
-        return (img_tensor,)
+        n_calls = max(1, n or 1)
+        if n_calls == 1:
+            responses = [_execute_one(0)]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(n_calls, 6)) as pool:
+                responses = list(pool.map(_execute_one, range(n_calls)))
+
+        img_tensors = [validate_and_cast_response(r) for r in responses]
+        if len(img_tensors) == 1:
+            return (img_tensors[0],)
+        # same size/prompt should yield same dimensions, but guard anyway
+        h, w = img_tensors[0].shape[1], img_tensors[0].shape[2]
+        aligned = []
+        for t in img_tensors:
+            if t.shape[1] != h or t.shape[2] != w:
+                t = common_upscale(t.movedim(-1, 1), w, h,
+                                   "bilinear", "center").movedim(1, -1)
+            aligned.append(t)
+        return (torch.cat(aligned, dim=0),)
 
 
 # A dictionary that contains all nodes you want to export with their names
