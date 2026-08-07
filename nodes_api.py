@@ -250,8 +250,13 @@ class GPTImage1Generate(ComfyNodeABC):
             print(f"No auth_token found, trying to get it from settings.")
             auth_token = AUTH_TOKEN
         if auth_token is None or auth_token == "":
-            # Fall back to environment variable so workflows can omit the token
-            auth_token = os.environ.get("CUSTOM_API_KEY", "")
+            # Fall back to environment variable so workflows can omit the token.
+            # Only for loopback api_base: otherwise a malicious workflow could
+            # exfiltrate the env credential by pointing api_base at its server.
+            from urllib.parse import urlparse
+            host = urlparse(api_base or "").hostname
+            if host in ("127.0.0.1", "localhost", "::1"):
+                auth_token = os.environ.get("CUSTOM_API_KEY", "")
         if auth_token == "":
             auth_token = None
 
