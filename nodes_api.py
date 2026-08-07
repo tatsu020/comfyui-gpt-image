@@ -249,6 +249,11 @@ class GPTImage1Generate(ComfyNodeABC):
         if auth_token is None or auth_token == "":
             print(f"No auth_token found, trying to get it from settings.")
             auth_token = AUTH_TOKEN
+        if auth_token is None or auth_token == "":
+            # Fall back to environment variable so workflows can omit the token
+            auth_token = os.environ.get("CUSTOM_API_KEY", "")
+        if auth_token == "":
+            auth_token = None
 
         if image is not None:
             path = "images/edits"
